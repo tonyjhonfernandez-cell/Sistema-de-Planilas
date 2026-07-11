@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from "react";
 import { Worker, PayrollPeriod, PayrollRecordItem } from "./types";
 import { getInitialWorkers } from "./data/initialWorkers";
+import { loadEstado, syncEstado, clearEstadoRemoto } from "./lib/api";
 import Dashboard from "./components/Dashboard";
 import WorkerManager from "./components/WorkerManager";
 import PayrollManager from "./components/PayrollManager";
@@ -37,7 +38,7 @@ export default function App() {
   const [currentPeriodId, setCurrentPeriodId] = useState("2026-06");
   const [isLoaded, setIsLoaded] = useState(false);
 
-  // Load from LocalStorage on mount
+  // Load from Neon (cloud database) on mount, with LocalStorage as fallback
   useEffect(() => {
     const savedLogin = sessionStorage.getItem("ugel_is_logged_in_v1");
     const isExpired = new Date() > EXPIRE_DATE;
@@ -45,91 +46,128 @@ export default function App() {
       setIsLoggedIn(true);
     }
 
-    let savedWorkersStr = localStorage.getItem("ugel_workers_v1");
-    let savedPeriodsStr = localStorage.getItem("ugel_periods_v1");
-    let savedPeriodId = localStorage.getItem("ugel_current_period_id_v1");
+    (async () => {
+      let remoteWorkers: Worker[] | null = null;
+      let remotePeriods: PayrollPeriod[] | null = null;
+      let remotePeriodId: string | null = null;
 
-    let initialWorkers: Worker[] = [];
-    if (savedWorkersStr) {
       try {
-        initialWorkers = JSON.parse(savedWorkersStr);
-      } catch (e) {
-        initialWorkers = getInitialWorkers();
-      }
-    } else {
-      initialWorkers = getInitialWorkers();
-      localStorage.setItem("ugel_workers_v1", JSON.stringify(initialWorkers));
-    }
-    setWorkers(initialWorkers);
-
-    let initialPeriods: PayrollPeriod[] = [];
-    if (savedPeriodsStr) {
-      try {
-        initialPeriods = JSON.parse(savedPeriodsStr);
-      } catch (e) {
-        initialPeriods = [];
-      }
-    }
-
-    // If no periods exist, bootstrap the Junio 2026 dataset from raw preloaded workers
-    if (initialPeriods.length === 0) {
-      const juneRecords: PayrollRecordItem[] = initialWorkers.map(w => {
-        const tRemun = w.defaultIncomes.reduce((sum, curr) => sum + curr.amount, 0);
-        const tDscto = w.defaultDeductions.reduce((sum, curr) => sum + curr.amount, 0);
-        return {
-          workerId: w.id,
-          workerDni: w.dni,
-          workerFullName: `${w.apellidos}, ${w.nombres}`,
-          workerCargo: w.cargo,
-          workerEstablecimiento: w.establecimiento,
-          workerRegimenPensionario: w.regimenPensionario,
-          leyendaMensual: "",
-          incomes: [...w.defaultIncomes],
-          deductions: [...w.defaultDeductions],
-          tRemun: Math.round(tRemun * 100) / 100,
-          tDscto: Math.round(tDscto * 100) / 100,
-          tLiqui: Math.round((tRemun - tDscto) * 100) / 100,
-          mImponible: Math.round(tRemun * 100) / 100
-        };
-      });
-
-      initialPeriods = [
-        {
-          id: "2026-06",
-          year: 2026,
-          month: 6,
-          label: "JUNIO - 2026",
-          isClosed: false,
-          records: juneRecords
+        const remote = await loadEstado();
+        if (remote) {
+          remoteWorkers = remote.workers;
+          remotePeriods = remote.periods;
+          remotePeriodId = remote.currentPeriodId;
         }
-      ];
+      } catch (e) {
+        console.error("No se pudo cargar desde la nube, usando datos locales", e);
+      }
+
+      let initialWorkers: Worker[] = [];
+      let initialPeriods: PayrollPeriod[] = [];
+      let needsSync = false;
+
+      if (remoteWorkers && remoteWorkers.length > 0) {
+        // Cloud data exists: it is the source of truth
+        initialWorkers = remoteWorkers;
+        initialPeriods = remotePeriods || [];
+      } else {
+        // No cloud data yet: bootstrap from LocalStorage or preloaded dataset
+        const savedWorkersStr = localStorage.getItem("ugel_workers_v1");
+        const savedPeriodsStr = localStorage.getItem("ugel_periods_v1");
+
+        if (savedWorkersStr) {
+          try {
+            initialWorkers = JSON.parse(savedWorkersStr);
+          } catch (e) {
+            initialWorkers = getInitialWorkers();
+          }
+        } else {
+          initialWorkers = getInitialWorkers();
+        }
+
+        if (savedPeriodsStr) {
+          try {
+            initialPeriods = JSON.parse(savedPeriodsStr);
+          } catch (e) {
+            initialPeriods = [];
+          }
+        }
+        needsSync = true;
+      }
+
+      // If no periods exist, bootstrap the Junio 2026 dataset from raw preloaded workers
+      if (initialPeriods.length === 0) {
+        const juneRecords: PayrollRecordItem[] = initialWorkers.map(w => {
+          const tRemun = w.defaultIncomes.reduce((sum, curr) => sum + curr.amount, 0);
+          const tDscto = w.defaultDeductions.reduce((sum, curr) => sum + curr.amount, 0);
+          return {
+            workerId: w.id,
+            workerDni: w.dni,
+            workerFullName: `${w.apellidos}, ${w.nombres}`,
+            workerCargo: w.cargo,
+            workerEstablecimiento: w.establecimiento,
+            workerRegimenPensionario: w.regimenPensionario,
+            leyendaMensual: "",
+            incomes: [...w.defaultIncomes],
+            deductions: [...w.defaultDeductions],
+            tRemun: Math.round(tRemun * 100) / 100,
+            tDscto: Math.round(tDscto * 100) / 100,
+            tLiqui: Math.round((tRemun - tDscto) * 100) / 100,
+            mImponible: Math.round(tRemun * 100) / 100
+          };
+        });
+
+        initialPeriods = [
+          {
+            id: "2026-06",
+            year: 2026,
+            month: 6,
+            label: "JUNIO - 2026",
+            isClosed: false,
+            records: juneRecords
+          }
+        ];
+        needsSync = true;
+      }
+
+      setWorkers(initialWorkers);
+      setPeriods(initialPeriods);
+      localStorage.setItem("ugel_workers_v1", JSON.stringify(initialWorkers));
       localStorage.setItem("ugel_periods_v1", JSON.stringify(initialPeriods));
-    }
-    setPeriods(initialPeriods);
 
-    if (savedPeriodId && initialPeriods.some(p => p.id === savedPeriodId)) {
-      setCurrentPeriodId(savedPeriodId);
-    } else {
-      setCurrentPeriodId(initialPeriods[0].id);
-    }
+      const savedPeriodId = remotePeriodId || localStorage.getItem("ugel_current_period_id_v1");
+      let periodIdToUse = initialPeriods[0].id;
+      if (savedPeriodId && initialPeriods.some(p => p.id === savedPeriodId)) {
+        periodIdToUse = savedPeriodId;
+      }
+      setCurrentPeriodId(periodIdToUse);
 
-    setIsLoaded(true);
+      // First run: push the bootstrapped dataset to the cloud database
+      if (needsSync) {
+        syncEstado({ workers: initialWorkers, periods: initialPeriods, currentPeriodId: periodIdToUse });
+      }
+
+      setIsLoaded(true);
+    })();
   }, []);
 
-  // Save State Helpers
+  // Save State Helpers (LocalStorage cache + Neon cloud sync)
   const saveWorkers = (newWorkers: Worker[]) => {
     setWorkers(newWorkers);
     localStorage.setItem("ugel_workers_v1", JSON.stringify(newWorkers));
+    syncEstado({ workers: newWorkers });
   };
 
   const savePeriods = (newPeriods: PayrollPeriod[]) => {
     setPeriods(newPeriods);
     localStorage.setItem("ugel_periods_v1", JSON.stringify(newPeriods));
+    syncEstado({ periods: newPeriods });
   };
 
   const handleSetCurrentPeriodId = (id: string) => {
     setCurrentPeriodId(id);
     localStorage.setItem("ugel_current_period_id_v1", id);
+    syncEstado({ currentPeriodId: id });
   };
 
   // 1. Add new worker master file
@@ -353,24 +391,28 @@ export default function App() {
     }
   };
 
-  // Hard Reset to preloaded state
+  // Hard Reset to preloaded state (clears cloud database too)
   const handleResetDatabase = () => {
     localStorage.removeItem("ugel_workers_v1");
     localStorage.removeItem("ugel_periods_v1");
     localStorage.removeItem("ugel_current_period_id_v1");
     
-    // Force reload page to trigger mount bootstrap
-    window.location.reload();
+    // Clear cloud data, then force reload page to trigger mount bootstrap
+    clearEstadoRemoto().finally(() => window.location.reload());
   };
 
-  // Clear database completely to start from scratch
+  // Clear database completely to start from scratch (clears cloud database too)
   const handleClearDatabase = () => {
-    saveWorkers([]);
-    savePeriods([]);
+    localStorage.setItem("ugel_workers_v1", JSON.stringify([]));
+    localStorage.setItem("ugel_periods_v1", JSON.stringify([]));
     localStorage.removeItem("ugel_current_period_id_v1");
-    
-    // Force reload page to trigger empty bootstrap
-    window.location.reload();
+
+    // Persist empty dataset to the cloud, then force reload page to trigger empty bootstrap
+    fetch("/api/estado", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ workers: [], periods: [], currentPeriodId: null })
+    }).catch(() => {}).finally(() => window.location.reload());
   };
 
   if (!isLoaded) {
@@ -632,9 +674,9 @@ export default function App() {
           <p>© 2026 Sistema Integrado de Planillas CAS - Oficina de Planillas y Recursos Humanos. Todos los derechos reservados.</p>
           <div className="flex items-center gap-4">
             <span className="flex items-center gap-1">
-              <span className="w-2 h-2 rounded-full bg-green-500 inline-block animate-pulse"></span> Sistema Local Online
+              <span className="w-2 h-2 rounded-full bg-green-500 inline-block animate-pulse"></span> Base de Datos en la Nube (Neon)
             </span>
-            <span>Versión 1.2.0</span>
+            <span>Versión 1.3.0</span>
           </div>
         </div>
       </footer>
